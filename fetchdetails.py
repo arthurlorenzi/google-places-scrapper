@@ -21,8 +21,8 @@ data = {
 start = 0
 
 # check whether we should resume some fetching done earlier
-if os.path.isfile('place_detail.json'):
-  with open('place_detail.json') as json_string:
+if os.path.isfile('place_details.json'):
+  with open('place_details.json') as json_string:
     data = json.load(json_string)
     if 'interruption_index' in data:
       start = data.pop('interruption_index', None)
@@ -44,5 +44,5 @@ for i in range(start, len(df)):
   else:
     data['fails'].append({ 'place_id':place_id, 'index': i })
 
-with open('place_detail.json', 'w') as out:
+with open('place_details.json', 'w') as out:
   json.dump(data, out)

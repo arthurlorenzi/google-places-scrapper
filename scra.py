@@ -1,234 +1,298 @@
-import json
-import os.path
-import re
-import time
-import traceback
+import json, os.path, re, shutil, time, traceback
 from selenium import webdriver
 from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 # custom exception
-class DataAccessDenied(Exception):
+class ReviewsNotLoading(Exception):
   pass
 
-def disable_wait():
-  driver.implicitly_wait(0)
+class tail_review_changed(object):
+  def __init__(self, context, old_tail):
+    self.context = context
+    self.old_tail = old_tail
 
-def enable_wait():
-  driver.implicitly_wait(10) # 10 seconds
+  def __call__(self, driver):
+    tail = driver.execute_script("return arguments[0].lastChild;", self.context)
+    if tail != self.old_tail:
+      return tail
+    else:
+      return False
 
-def element_exists(selector, context, return_el, wait):
-  if not wait:
-    disable_wait()
+def backup_data():
+  if not os.path.isfile('place_details.orig.json'):
+    shutil.copy2('place_details.json', 'place_details.orig.json')
 
+def load():
+  if os.path.isfile('place_details.json'):
+    with open('place_details.json') as json_string:
+      return json.load(json_string)
+  else:
+    return None
+
+def log_interruption(output, key, e):
+  output["interruption"] = {
+    "key": key,
+    "str": str(e),
+    "repr": repr(e)
+  }
+
+def save_result(data):
+  with open('place_details.json', 'w') as out:
+    json.dump(data, out)
+
+def safe_find(context, selector):
   try:
     el = context.find_element_by_css_selector(selector)
   except:
     el = None
 
-  if not wait:
-    enable_wait()
+  return el
 
-  return el if return_el else bool(el)
+def go_to_reviews(place):
+  open_reviews = driver.find_element_by_css_selector('button[jsaction="pane.rating.moreReviews"]')
+  place['review_count'] = int(''.join(re.findall('\d+', open_reviews.text)))
+  open_reviews.click()
 
-def child_element_count(el):
-  return driver.execute_script("return arguments[0].childElementCount;", el)
+def scrap_popular_times(place):
+  popular_times = driver.find_elements_by_css_selector('.section-popular-times-container > div')
+  # search for popular times
+  if popular_times and len(popular_times) == 7:
+    place['popular_times'] = {}
+    day_number = 0;
 
-def to_place_page(place_detail):
-  driver.get(place_detail['url'])
+    for day in popular_times:
+      place['popular_times'][day_number] = {}
+      hour_number = 6;
 
-def store_reviews(out, start_el):
-  # if we dont have start_el, all reviews are considered
-  if start_el is None:
-    start_el = driver.find_element_by_css_selector('div[data-review-id="0"]')
-    reviews = [start_el]
-  else:
-    reviews = []
+      hours = day.find_elements_by_css_selector('.section-popular-times-bar')
 
-  reviews = reviews + driver.execute_script('''
-    var start_el = arguments[0],
-      arr = [];
-      node = start_el.nextElementSibling;
+      if len(hours) == 1: # place isnt open that day
+        continue
+
+      for hour in hours:
+        bar = hour.find_element_by_css_selector('.section-popular-times-value')
+        if not bar:
+          bar = hour.find_element_by_css_selector('.section-popular-times-current-value')
+
+        place['popular_times'][day_number][hour_number] = int(bar.get_attribute("aria-label")[:-1])
+        hour_number += 1
+
+      day_number += 1
+
+
+def scrap_reviews(place, msg_prefix):
+  # remove API reviews
+  place['reviews'] = []
+
+  # wait until scrollbox loads
+  scrollbox = wait.until(
+    EC.presence_of_element_located((By.CLASS_NAME, 'section-scrollbox'))
+  )
+  databox = driver.find_element_by_css_selector("div.section-listbox:not(.section-listbox-root):not(.section-scrollbox)")
+
+  # hardcoded await to avoid stale elements
+  time.sleep(1)
+
+  loaded_reviews = driver.execute_script("return arguments[0].childElementCount;", databox)
+  head_review = driver.execute_script("return arguments[0].firstChild", databox)
+
+  if loaded_reviews == 0:
+    # ops... google doesnt want us to fetch reviews
+    raise ReviewsNotLoading("Reviews not loading >:(")
+  
+  # saves first review
+  place['reviews'].append(scrap_review(head_review))
+  last_scraped_review = head_review
+  tail_review = None
+  scrap_count = 1
+
+  if loaded_reviews == place['review_count']:
+    # saves all reviews
+    scrap_new_reviews(place, head_review)
+    return
+
+  while scrap_count < place['review_count']:
+    # scrolls down to load new reviews...
+    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scrollbox)
+    # ...wait for new reviews
+    tail_review = wait.until(tail_review_changed(databox, tail_review))
+    # scrap reviews
+    scrap_count += scrap_new_reviews(place, last_scraped_review)
+    head_review = remove_reviews(head_review, tail_review)
+    last_scraped_review = tail_review
+    print("\r{0} - {1} - Reviews scraped: {2}/{3}".format(
+      msg_prefix, place['name'], scrap_count, place['review_count']), end = ""
+    )
+  print("")
+
+def scrap_new_reviews(place, last_scraped_review):
+  reviews = driver.execute_script('''
+    var node = arguments[0].nextElementSibling,
+        arr = [];
 
       while (node) {
         arr.push(node);
         node = node.nextElementSibling;
       }
 
-      return arr;''', start_el)
-
-  last_stored_el = reviews[-1]
+      return arr;''', last_scraped_review)
 
   for review in reviews:
-    try:
-      review_obj = {}
+    place["reviews"].append(scrap_review(review))
 
-      # expand the review
-      more = element_exists('button[jsaction="pane.review.expandReview"]', review, True, False)
-      if more and more.is_displayed():
-        more.click()
+  return len(reviews)
 
-      # find review text
-      text_el = review.find_element_by_class_name('section-review-text')
-      review_obj['text'] = text_el.text
+def remove_reviews(head_review, tail_review):
+  # always preserve 20 reviews
+  remove_count = (int(tail_review.get_attribute("data-review-id"))
+    - int(head_review.get_attribute("data-review-id")) - 20)
 
-      # stars
-      stars = review.find_elements_by_class_name('section-review-star-active')
-      review_obj['stars'] = len(stars)
+  return driver.execute_script('''
+    var node = arguments[0],
+      count = Number(arguments[1]),
+      aux;
 
-      # publish date
-      publish_date = review.find_element_by_class_name('section-review-publish-date')
-      review_obj["publish_date"] = publish_date.text
+    for (var i = 0; i < count; ++i) {
+      aux = node;
+      node = node.nextElementSibling;
+      aux.remove();
+    }
 
-      # local guide or not
-      local_guide = review.find_element_by_class_name('section-review-subtitle-local-guide')
-      if local_guide and local_guide.is_displayed():
-        review_obj['local_guide'] = True 
-      else:
-        review_obj['local_guide'] = False
+    return node;
+    ''', head_review, remove_count)
 
-      # number of reviews done by the user
-      other_reviews = review.find_element_by_css_selector('.section-review-subtitle:last-child')
-      if other_reviews and other_reviews.is_displayed():
-        matches = re.search('[.\d]+', other_reviews.text)
-        review_obj['other_reviews'] = int(matches.group(0).replace('.', '')) if matches else 0
-      else:
-        review_obj['other_reviews'] = 0
+def scrap_review(review):
+  review_obj = {}
 
-      # find review thumbs
-      review_thumbs_up = element_exists('.section-review-thumbs-up-count', review, True, False)
-      if review_thumbs_up and review_thumbs_up.text:
-        review_obj['thumbs_up'] = int(review_thumbs_up.text)
-      else:
-        review_obj['thumbs_up'] = 0
+  # expand the review
+  more = safe_find(review, 'button[jsaction="pane.review.expandReview"]')
+  if more and more.is_displayed():
+    more.click()
 
-      out["reviews"].append(review_obj)
-    except StaleElementReferenceException: 
-      print("Stale element exception for {0}".format(out["name"]))
-      continue
+  # find review author
+  author_el = review.find_element_by_css_selector('.section-review-title > span')
+  review_obj['author_name'] = author_el.text
 
-  return last_stored_el
+  # find review text
+  text_el = review.find_element_by_class_name('section-review-text')
+  # store only the original comment
+  matches = re.search('^\(Translated by Google\).*\n*\(Original\)\n*(.*)', text_el.text)
+  if matches:
+    review_obj['text'] = match.group(1)
+    review_obj['lang'] = None
+  else:
+    review_obj['text'] = text_el.text
+    review_obj['lang'] = 'en'
 
-def get_reviews(out):
-  # get scroll and data box
-  scrollbox = driver.find_element_by_class_name("section-scrollbox")
-  databox = driver.find_element_by_css_selector("div.section-listbox:not(.section-listbox-root):not(.section-scrollbox)")
-  loadedreviews = child_element_count(databox)
-  store_state = None
-  repeat = True
+  # stars
+  stars = review.find_elements_by_class_name('section-review-star-active')
+  review_obj['rating'] = len(stars)
 
-  # hardcoded wait to avoid stale elements
-  time.sleep(1)
+  # publish date
+  publish_date = review.find_element_by_class_name('section-review-publish-date')
+  review_obj["relative_time_description"] = publish_date.text
 
-  if loadedreviews == 0:
-    # ops... google doesnt want us to fetch reviews
-    raise DataAccessDenied("Reviews not loading >:(")
-  elif loadedreviews == out['review_count']:
-    # saves all reviews
-    store_state = store_reviews(out, store_state)
+  # local guide or not
+  local_guide = review.find_element_by_class_name('section-review-subtitle-local-guide')
+  if local_guide.is_displayed():
+    review_obj['local_guide'] = True 
+  else:
+    review_obj['local_guide'] = False
 
-  while repeat and loadedreviews < out['review_count']:
-    try:
-      # scrolls down to load new reviews...
-      driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scrollbox)
-      # ...wait for new review to load
-      if element_exists('div[data-review-id="{0}"]'.format(loadedreviews), databox, False, True):
-        loadedreviews = child_element_count(databox)
-        # save reviews
-        store_state = store_reviews(out, store_state)
-      else:
-        break
-    except:
-      # that helpful error message thou
-      print("Something happened while fetching review {0} for {1}".format(loadedreviews, out['name']))
-      repeat = False
+  # number of reviews done by the user
+  other_reviews = review.find_element_by_css_selector('.section-review-subtitle:last-child')
+  if other_reviews.is_displayed():
+    matches = re.search('[.\d]+', other_reviews.text)
+    review_obj['other_reviews'] = int(matches.group(0).replace('.', '')) if matches else 0
+  else:
+    review_obj['other_reviews'] = 0
 
-def save_result(data):
-  with open('result.json', 'w') as out:
-    json.dump(data, out)
+  # find review thumbs
+  review_thumbs_up = safe_find(review, '.section-review-thumbs-up-count')
+  if review_thumbs_up and review_thumbs_up.text:
+    review_obj['thumbs_up'] = int(review_thumbs_up.text)
+  else:
+    review_obj['thumbs_up'] = 0
+
+  review_obj['scrap_time'] = time.time();
+
+  return review_obj
 
 def main():
-  global driver
 
-  path_to_chromedriver = '/home/arthurlorenzi/scrap/chromedriver'
-  driver = webdriver.Chrome(executable_path = path_to_chromedriver)
+  backup_data()
 
-  place_details = {}
-  data = {} # scrap data
-  resume_index = '' # we will scrap from this index to the end
-
-  # loads place details file
-  if os.path.isfile('place_detail.json'):
-    with open('place_detail.json') as json_string:
-      place_details = json.load(json_string)
+  place_details = load()
+  
+  if place_details is None:
+    print("File place_details.json not found")
+    return
   else:
-    print("File place_detail.json not found")
-    exit()
+    resume_index = '' # we will scrap from this index
+    if 'interruption' in place_details:
+      resume_index = place_details["interruption"]["key"]
+      place_details.pop("interruption", None)
 
-  # check previous result file
-  if os.path.isfile('result.json'):
-    with open('result.json') as json_string:
-      data = json.load(json_string)
-      if 'interruption_index' in data:
-        # continue from where we stopped
-        resume_index = data.pop('interruption_index', None)
+  global driver
+  driver = webdriver.Chrome(executable_path='/home/arthurlorenzi/scrap/chromedriver')
 
-  # start scrapping
-  enable_wait()
+  global wait
+  wait = WebDriverWait(driver, 20)
 
+  i = 0
   for key in sorted(place_details.keys()):
     try:
+      i += 1
+      place = place_details[key]
+
       # not very pretty
-      if key < resume_index or key == 'fails':
+      if (key < resume_index or key == 'fails'
+          or 'permanently_closed' in place):
         continue
 
-      data[key] = record_out = {
-        "error": '',
-        "closed": 'permanently_closed' in place_details[key],
-        "name": place_details[key]['name'],
-        "review_count": 0,
-        "reviews": []
-      }
+      # en, es-419, pt-BR
+      driver.get(place['url'] + '&hl=en')
 
-      if record_out['closed'] or not 'reviews' in place_details[key]:
-        continue;
+      time.sleep(1)
 
-      # navigate to place page
-      to_place_page(place_details[key])
+      scrap_popular_times(place)
 
-      # go to reviews
-      try:
-        open_reviews = WebDriverWait(driver, 10).until(
-          EC.visibility_of_element_located((By.CSS_SELECTOR, 'button[jsaction="pane.rating.moreReviews"]'))
-        )
-        digit_list = re.findall('\d+', open_reviews.text)
-        record_out['review_count'] = int(''.join(digit_list))
-        open_reviews.click()
-      except:
-        print("review button was not found for {0} :(".format(record_out['name']))
+      if not 'reviews' in place:
+        place['review_count'] = 0
         continue
+      
+      #driver.save_screenshot('out.png');
 
-      try:
-        # stores review data on output object "record_out"
-        get_reviews(record_out)
-      except DataAccessDenied as err:
-        print("Data access denied exception for {0}".format(record_out['name']))
-        data["interruption_index"] = key
-        break
+      go_to_reviews(place)
+
+      scrap_reviews(place, "Place {0}/{1}".format(i, len(place_details.keys())))
 
       # save what we have so far
-      save_result(data)
+      save_result(place_details)
 
-    except Exception as err:
+    except TimeoutException:
+      # failed to load reviews
+      place["scrap_interruption"] = { "type": "timeout" }
+      print("")
+      continue
+    except StaleElementReferenceException:
+      # this is bad too
+      place["scrap_interruption"] = { "type": "stale_element_reference" }
+      print("")
+      continue
+    except ReviewsNotLoading as e:
+      log_interruption(place_details, key, e)
+      break
+    except Exception as e:
       # in case of a unexpected exception
-      traceback.print_exc()
-      data["interruption_index"] = key
+      log_interruption(place_details, key, e)
       break
 
-  save_result(data)
+  save_result(place_details)
   driver.close()
 
 if __name__ == "__main__":
