@@ -182,7 +182,7 @@ def scrap_review(review):
   # store only the original comment
   matches = re.search('^\(Translated by Google\).*\n*\(Original\)\n*(.*)', text_el.text)
   if matches:
-    review_obj['text'] = match.group(1)
+    review_obj['text'] = matches.group(1)
     review_obj['lang'] = None
   else:
     review_obj['text'] = text_el.text
