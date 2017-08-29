@@ -37,16 +37,16 @@ def load():
 
 def interruption_index():
   try:
-    with open(".interruption.info", "r") as json_string:
+    with open("_interruption", "r") as json_string:
       index = json.load(json_string)["key"]
-    os.remove('.interruption.info')
+    os.remove('_interruption')
   except FileNotFoundError:
     index = ''
 
   return index
 
 def log_interruption(output, key, e):
-  with open(".interruption.info", "w") as out:
+  with open("_interruption", "w") as out:
     json.dump({
       "key": key,
       "str": str(e),
@@ -54,8 +54,22 @@ def log_interruption(output, key, e):
     }, out)
 
 def save_progress(key, data):
-  with open('scrap-result', 'a') as out:
+  with open('_temp-result', 'a') as out:
     out.write(key + ":" + json.dumps(data) + "\n")
+
+def create_result_file():
+  data = {}
+
+  with open("_temp-result", "r") as temp:
+    for line in temp:
+      key = re.search('^((-|\w)*?):', line).group(1)
+      json_string = re.search(':(.*)', line).group(1)
+      data[key] = json.load(json_string)
+    os.remove('_temp-result')
+
+  with open("result.json", "w") as out:
+    json.dump(data, out)
+
 
 def safe_find(context, selector):
   try:
@@ -278,17 +292,20 @@ def main():
 
       time.sleep(1)
 
-      scraped_data['popular_times'] = scrap_popular_times()
+      popular_times = scrap_popular_times()
+      if popular_times:
+        scraped_data['popular_times'] = popular_times
 
       if not 'reviews' in place:
-        save_progress(key, scraped_data)
         continue
       
       #driver.save_screenshot('out.png');
 
       review_count = go_to_reviews()
-
-      scraped_data['reviews'] = scrap_reviews(review_count, "Place {0}/{1}".format(i, len(place_details.keys())))
+      
+      reviews = scrap_reviews(review_count, "Place {0}/{1}".format(i, len(place_details.keys())))
+      if reviews:
+        scraped_data['reviews'] = reviews
 
     except TimeoutException:
       # failed to load reviews
@@ -313,6 +330,7 @@ def main():
       save_progress(key, scraped_data)
 
   driver.close()
+  create_result_file()  
 
 if __name__ == "__main__":
   main()
