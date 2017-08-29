@@ -1,4 +1,4 @@
-import json, os.path, re, shutil, time, traceback
+import json, os, re, time, traceback
 from selenium import webdriver
 from selenium.common.exceptions import StaleElementReferenceException
 from selenium.common.exceptions import TimeoutException
@@ -10,39 +10,52 @@ from selenium.webdriver.support.ui import WebDriverWait
 class ReviewsNotLoading(Exception):
   pass
 
-class tail_review_changed(object):
-  def __init__(self, context, old_tail):
+class last_child_changed(object):
+  def __init__(self, context):
     self.context = context
-    self.old_tail = old_tail
+    self.old_last = driver.execute_script("return arguments[0].lastChild;", self.context)
 
   def __call__(self, driver):
-    tail = driver.execute_script("return arguments[0].lastChild;", self.context)
-    if tail != self.old_tail:
-      return tail
+    last = driver.execute_script("return arguments[0].lastChild;", self.context)
+    if last != self.old_last:
+      # returns first element after old last child
+      return driver.execute_script("return arguments[0].nextElementSibling", self.old_last)
     else:
       return False
 
-def backup_data():
-  if not os.path.isfile('place_details.orig.json'):
-    shutil.copy2('place_details.json', 'place_details.orig.json')
+conf = {
+  # en, es-419, pt-BR,...
+  "lang": "en",
+  "translation_text": "(Translated by Google)",
+  "same_lang_only": True,
+  "comments_only": True
+}
 
 def load():
-  if os.path.isfile('place_details.json'):
-    with open('place_details.json') as json_string:
-      return json.load(json_string)
-  else:
-    return None
+  with open("place_details.json", "r") as json_string:
+    return json.load(json_string)
+
+def interruption_index():
+  try:
+    with open(".interruption.info", "r") as json_string:
+      index = json.load(json_string)["key"]
+    os.remove('.interruption.info')
+  except FileNotFoundError:
+    index = ''
+
+  return index
 
 def log_interruption(output, key, e):
-  output["interruption"] = {
-    "key": key,
-    "str": str(e),
-    "repr": repr(e)
-  }
+  with open(".interruption.info", "w") as out:
+    json.dump({
+      "key": key,
+      "str": str(e),
+      "repr": repr(e)
+    }, out)
 
-def save_result(data):
-  with open('place_details.json', 'w') as out:
-    json.dump(data, out)
+def save_progress(key, data):
+  with open('scrap-result', 'a') as out:
+    out.write(key + ":" + json.dumps(data) + "\n")
 
 def safe_find(context, selector):
   try:
@@ -52,20 +65,24 @@ def safe_find(context, selector):
 
   return el
 
-def go_to_reviews(place):
-  open_reviews = driver.find_element_by_css_selector('button[jsaction="pane.rating.moreReviews"]')
-  place['review_count'] = int(''.join(re.findall('\d+', open_reviews.text)))
+def go_to_reviews():
+  open_reviews = wait.until(
+    EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[jsaction="pane.rating.moreReviews"]'))
+  )
+  count = int(''.join(re.findall('\d+', open_reviews.text)))
   open_reviews.click()
 
-def scrap_popular_times(place):
+  return count
+
+def scrap_popular_times():
+  data = {}
   popular_times = driver.find_elements_by_css_selector('.section-popular-times-container > div')
   # search for popular times
   if popular_times and len(popular_times) == 7:
-    place['popular_times'] = {}
     day_number = 0;
 
     for day in popular_times:
-      place['popular_times'][day_number] = {}
+      data[day_number] = {}
       hour_number = 6;
 
       hours = day.find_elements_by_css_selector('.section-popular-times-bar')
@@ -78,15 +95,15 @@ def scrap_popular_times(place):
         if not bar:
           bar = hour.find_element_by_css_selector('.section-popular-times-current-value')
 
-        place['popular_times'][day_number][hour_number] = int(bar.get_attribute("aria-label")[:-1])
+        data[day_number][hour_number] = int(bar.get_attribute("aria-label")[:-1])
         hour_number += 1
 
       day_number += 1
 
+  return data
 
-def scrap_reviews(place, msg_prefix):
-  # remove API reviews
-  place['reviews'] = []
+def scrap_reviews(review_count, msg_prefix):
+  data = []
 
   # wait until scrollbox loads
   scrollbox = wait.until(
@@ -97,40 +114,54 @@ def scrap_reviews(place, msg_prefix):
   # hardcoded await to avoid stale elements
   time.sleep(1)
 
-  loaded_reviews = driver.execute_script("return arguments[0].childElementCount;", databox)
-  head_review = driver.execute_script("return arguments[0].firstChild", databox)
-
-  if loaded_reviews == 0:
+  first_reviews_count = driver.execute_script("return arguments[0].childElementCount;", databox)
+  if first_reviews_count == 0:
     # ops... google doesnt want us to fetch reviews
     raise ReviewsNotLoading("Reviews not loading >:(")
   
-  # saves first review
-  place['reviews'].append(scrap_review(head_review))
-  last_scraped_review = head_review
-  tail_review = None
-  scrap_count = 1
+  head_review = driver.execute_script("return arguments[0].firstChild", databox)
+  next_review = head_review
+  loaded_reviews = 0
+  stop = False
 
-  if loaded_reviews == place['review_count']:
-    # saves all reviews
-    scrap_new_reviews(place, head_review)
-    return
+  while True:
+    # scrap reviews
+    reviews = get_new_reviews(next_review)
 
-  while scrap_count < place['review_count']:
+    loaded_reviews += len(reviews)
+
+    for review in reviews:
+      if ((conf['comments_only'] and not has_comment(review))
+        or (conf['same_lang_only'] and not has_conf_lang(review))):
+        # "Most helpful" criteria ranks first reviews that are written
+        # in the same language that Maps is loaded, then reviews in other
+        # languages and then reviews that doesn't have comments. So it is
+        # safe to stop when a comment that doesn't match our criteria is
+        # found
+        stop = True
+        break
+      else:
+        data.append(scrap_review(review))
+
+    print("\r{0} - Reviews loaded: {1}/{2}"
+      .format(msg_prefix, loaded_reviews, review_count), end = "")
+
+    if loaded_reviews == review_count or stop:
+      break
+
     # scrolls down to load new reviews...
     driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scrollbox)
-    # ...wait for new reviews
-    tail_review = wait.until(tail_review_changed(databox, tail_review))
-    # scrap reviews
-    scrap_count += scrap_new_reviews(place, last_scraped_review)
-    head_review = remove_reviews(head_review, tail_review)
-    last_scraped_review = tail_review
-    print("\r{0} - {1} - Reviews scraped: {2}/{3}".format(
-      msg_prefix, place['name'], scrap_count, place['review_count']), end = ""
-    )
-  print("")
+    # ...wait for new reviews...
+    next_review = wait.until(last_child_changed(databox))
+    # ...remove some elements if needed
+    head_review = remove_reviews(head_review, next_review)
 
-def scrap_new_reviews(place, last_scraped_review):
-  reviews = driver.execute_script('''
+  print(" [Loaded comments based on criteria]")
+
+  return data
+
+def get_new_reviews(next_review):
+  return [next_review] + driver.execute_script('''
     var node = arguments[0].nextElementSibling,
         arr = [];
 
@@ -139,12 +170,7 @@ def scrap_new_reviews(place, last_scraped_review):
         node = node.nextElementSibling;
       }
 
-      return arr;''', last_scraped_review)
-
-  for review in reviews:
-    place["reviews"].append(scrap_review(review))
-
-  return len(reviews)
+      return arr;''', next_review)
 
 def remove_reviews(head_review, tail_review):
   # always preserve 20 reviews
@@ -165,6 +191,16 @@ def remove_reviews(head_review, tail_review):
     return node;
     ''', head_review, remove_count)
 
+def has_comment(review):
+  text_el = review.find_element_by_class_name('section-review-text')
+
+  return True if text_el.text else False
+
+def has_conf_lang(review):
+  text_el = review.find_element_by_class_name('section-review-text')
+
+  return False if conf['translation_text'] in text_el.text else True
+
 def scrap_review(review):
   review_obj = {}
 
@@ -179,14 +215,8 @@ def scrap_review(review):
 
   # find review text
   text_el = review.find_element_by_class_name('section-review-text')
-  # store only the original comment
-  matches = re.search('^\(Translated by Google\).*\n*\(Original\)\n*(.*)', text_el.text)
-  if matches:
-    review_obj['text'] = matches.group(1)
-    review_obj['lang'] = None
-  else:
-    review_obj['text'] = text_el.text
-    review_obj['lang'] = 'en'
+  review_obj['text'] = text_el.text
+  review_obj['lang'] = conf['lang'] if conf['same_lang_only'] else None
 
   # stars
   stars = review.find_elements_by_class_name('section-review-star-active')
@@ -223,19 +253,8 @@ def scrap_review(review):
   return review_obj
 
 def main():
-
-  backup_data()
-
   place_details = load()
-  
-  if place_details is None:
-    print("File place_details.json not found")
-    return
-  else:
-    resume_index = '' # we will scrap from this index
-    if 'interruption' in place_details:
-      resume_index = place_details["interruption"]["key"]
-      place_details.pop("interruption", None)
+  resume_index = interruption_index() # we will scrap from this index
 
   global driver
   driver = webdriver.Chrome(executable_path='/home/arthurlorenzi/scrap/chromedriver')
@@ -248,51 +267,51 @@ def main():
     try:
       i += 1
       place = place_details[key]
+      scraped_data = {}
 
       # not very pretty
       if (key < resume_index or key == 'fails'
           or 'permanently_closed' in place):
         continue
 
-      # en, es-419, pt-BR
-      driver.get(place['url'] + '&hl=en')
+      driver.get(place['url'] + '&hl=' + conf['lang'])
 
       time.sleep(1)
 
-      scrap_popular_times(place)
+      scraped_data['popular_times'] = scrap_popular_times()
 
       if not 'reviews' in place:
-        place['review_count'] = 0
+        save_progress(key, scraped_data)
         continue
       
       #driver.save_screenshot('out.png');
 
-      go_to_reviews(place)
+      review_count = go_to_reviews()
 
-      scrap_reviews(place, "Place {0}/{1}".format(i, len(place_details.keys())))
-
-      # save what we have so far
-      save_result(place_details)
+      scraped_data['reviews'] = scrap_reviews(review_count, "Place {0}/{1}".format(i, len(place_details.keys())))
 
     except TimeoutException:
       # failed to load reviews
-      place["scrap_interruption"] = { "type": "timeout" }
-      print("")
+      scraped_data["scrap_interruption"] = { "type": "timeout" }
+      print(" [Interrupted by TimeoutException]")
       continue
     except StaleElementReferenceException:
       # this is bad too
-      place["scrap_interruption"] = { "type": "stale_element_reference" }
-      print("")
+      scraped_data["scrap_interruption"] = { "type": "stale_element_reference" }
+      print(" [Interrupted by StaleElementReferenceException]")
       continue
     except ReviewsNotLoading as e:
       log_interruption(place_details, key, e)
       break
     except Exception as e:
       # in case of a unexpected exception
+      print(e)
       log_interruption(place_details, key, e)
       break
+    finally:
+      # save what we have so far
+      save_progress(key, scraped_data)
 
-  save_result(place_details)
   driver.close()
 
 if __name__ == "__main__":
