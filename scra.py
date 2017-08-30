@@ -24,7 +24,7 @@ class last_child_changed(object):
       return False
 
 conf = {
-  # en, es-419, pt-BR,...
+  # en, es, pt-BR,...
   "lang": "en",
   "translation_text": "(Translated by Google)",
   "same_lang_only": True,
@@ -64,7 +64,7 @@ def create_result_file():
     for line in temp:
       key = re.search('^((-|\w)*?):', line).group(1)
       json_string = re.search(':(.*)', line).group(1)
-      data[key] = json.load(json_string)
+      data[key] = json.loads(json_string)
     os.remove('_temp-result')
 
   with open("result.json", "w") as out:
